@@ -1,0 +1,9 @@
+.slurm/
+runs/
+*.tmp
+*.tar.zst
+archive2tape_manifest.tsv
+archive2tape_tar_paths.txt
+archive2tape_metadata.env
+archive2tape_archive_objects.txt
+archive2tape_watchers_*/
