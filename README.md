@@ -3,7 +3,7 @@
 Levante helper for compressing selected model-output files, then using Packems to
 pack, index, archive, retrieve, and unpack them through DKRZ HSM tape.
 
-`archive2tape` keeps a small beginner-friendly interface around the maintained
+`archive2tape` keeps a beginner-friendly interface around the maintained
 ESM tools:
 
 - local stage: select paths and compress them into `WORK_DIR/compressed`
@@ -66,7 +66,10 @@ archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive \
 
 `get` runs `unpackems` to restore the compressed staging tree from the Packems
 `INDEX.txt`. When retrieval is complete, run the printed `archive2tape unpack`
-command to decompress into `model_output_from_archive`.
+command to decompress into `model_output_from_archive`. Note that the path 
+`GRAVEYARD` is points to `/scratch/`, where data gets deleted 14 days after 
+the last file access. 
+
 
 ## Stage Commands
 
