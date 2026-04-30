@@ -10,7 +10,7 @@ while preserving the source directory tree.
 Add this directory to your `PATH`:
 
 ```bash
-export PATH="/path/to/polarcap_analysis/scripts/archive2tape:$PATH"
+export PATH="/path/to/archive2tape/:$PATH"
 ```
 
 Before using tape commands on Levante:
