@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ARCHIVE2TAPE="$SCRIPT_DIR/archive2tape"
 
 python3 - "$ARCHIVE2TAPE" <<'PY'
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,19 +16,28 @@ archive2tape = Path(sys.argv[1])
 repo = archive2tape.parents[2]
 
 
-def run(args, check=True):
+def run(args, check=True, env=None):
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
     proc = subprocess.run(
         [str(archive2tape), *args],
         cwd=repo,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=merged_env,
     )
     if check and proc.returncode != 0:
         raise SystemExit(
             f"FAILED {' '.join(args)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
     return proc
+
+
+def write_executable(path: Path, content: str):
+    path.write_text(content)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
 subprocess.run(["bash", "-n", str(archive2tape)], check=True)
@@ -61,6 +72,7 @@ with tempfile.TemporaryDirectory(prefix="a2t_fixture_") as tmp:
     assert "ARCHIVE_DIR=/arch/ab1234/" in proc.stdout, proc.stdout
     assert "ACCOUNT=ab1234_cpu" in proc.stdout, proc.stdout
     assert "SELECTED_ENTRIES=2" in proc.stdout, proc.stdout
+    assert "COMPRESSED_DIR=" in proc.stdout, proc.stdout
 
     bad_config = root / "bad.conf"
     bad_config.write_text("PROJECT=$(echo bad)\n")
@@ -72,9 +84,7 @@ with tempfile.TemporaryDirectory(prefix="a2t_fixture_") as tmp:
     assert proc.returncode != 0 and "only $USER is allowed" in proc.stderr, proc.stderr
 
     work = root / "work"
-    work.mkdir()
-    (work / "one.tar.zst").write_text("fake")
-    (work / "two.tar.zst").write_text("fake")
+    (work / "compressed").mkdir(parents=True)
     proc = run(
         [
             "archive",
@@ -84,22 +94,17 @@ with tempfile.TemporaryDirectory(prefix="a2t_fixture_") as tmp:
             "ab1234",
             "--allow-non-scratch-work",
             "--dry-run",
-        ],
-        check=False,
+        ]
     )
-    assert proc.returncode != 0 and "Multiple .tar.zst files" in proc.stderr, proc.stderr
-
-    manifest = work / "archive2tape_archive_objects.txt"
-    manifest.write_text(str(work / "one.tar.zst") + "\n")
-    proc = run(["unpack", str(work), str(root / "out"), "--dry-run"])
-    assert str(work / "one.tar.zst") in proc.stdout, proc.stdout
-    assert str(work / "two.tar.zst") not in proc.stdout, proc.stdout
+    assert "packems" in proc.stdout and "PACKEMS_INDEX=/arch/ab1234/user/my_run/INDEX.txt" in proc.stdout, proc.stdout
 
 print("local fixture checks passed")
 PY
 
 if command -v zstd >/dev/null 2>&1; then
     python3 - "$ARCHIVE2TAPE" <<'PY'
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -108,6 +113,32 @@ from pathlib import Path
 archive2tape = Path(sys.argv[1])
 repo = archive2tape.parents[2]
 
+
+def run(args, check=True, env=None):
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    proc = subprocess.run(
+        [str(archive2tape), *args],
+        cwd=repo,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=merged_env,
+    )
+    if check and proc.returncode != 0:
+        raise SystemExit(
+            f"FAILED {' '.join(args)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+    return proc
+
+
+def write_executable(path: Path, content: str):
+    path.write_text(content)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
 with tempfile.TemporaryDirectory(prefix="a2t_pack_") as tmp:
     root = Path(tmp)
     source = root / "src"
@@ -115,13 +146,15 @@ with tempfile.TemporaryDirectory(prefix="a2t_pack_") as tmp:
     output = root / "out"
     source.mkdir()
     (source / "a.nc").write_text("payload")
+    nested = source / "nested"
+    nested.mkdir()
+    (nested / "b.grib2").write_text("nested payload")
     zarr = source / "store.zarr"
     zarr.mkdir()
-    (zarr / "nested.nc").write_text("nested")
+    (zarr / "nested.nc").write_text("zarr payload")
 
-    subprocess.run(
+    run(
         [
-            str(archive2tape),
             "pack",
             str(source),
             str(work),
@@ -131,26 +164,76 @@ with tempfile.TemporaryDirectory(prefix="a2t_pack_") as tmp:
             "ab1234",
             "--allow-non-scratch-work",
             "--run-now",
-        ],
-        cwd=repo,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        ]
     )
-    subprocess.run(
-        [str(archive2tape), "unpack", str(work), str(output)],
-        cwd=repo,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    run(["unpack", str(work), str(output)])
     assert (output / "a.nc").read_text() == "payload"
-    assert (output / "store.zarr" / "nested.nc").read_text() == "nested"
+    assert (output / "nested" / "b.grib2").read_text() == "nested payload"
+    assert (output / "store.zarr" / "nested.nc").read_text() == "zarr payload"
 
-print("pack/unpack smoke passed")
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    packems_log = root / "packems.log"
+    write_executable(bin_dir / "tapeinit", "#!/usr/bin/env bash\nexit 0\n")
+    write_executable(
+        bin_dir / "packems",
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$PACKEMS_LOG\"\nexit 0\n",
+    )
+    write_executable(
+        bin_dir / "unpackems",
+        """#!/usr/bin/env bash
+set -euo pipefail
+dest=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d) dest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$dest/compressed"
+cp -R "$UNPACKEMS_SOURCE"/. "$dest/compressed"/
+""",
+    )
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "PACKEMS_LOG": str(packems_log),
+        "UNPACKEMS_SOURCE": str(work / "compressed"),
+    }
+    run(
+        [
+            "archive",
+            str(work),
+            "/arch/ab1234/user/my_run",
+            "--project",
+            "ab1234",
+            "--allow-non-scratch-work",
+            "--run-now",
+        ],
+        env=env,
+    )
+    log = packems_log.read_text()
+    assert "--no-archive compressed" in log, log
+    assert "--archive-only compressed" in log, log
+
+    retrieved_out = root / "retrieved_out"
+    run(
+        [
+            "retrieve",
+            "/arch/ab1234/user/my_run",
+            str(work),
+            "--project",
+            "ab1234",
+            "--allow-non-scratch-work",
+            "--run-now",
+        ],
+        env=env,
+    )
+    run(["unpack", str(work), str(retrieved_out), "--overwrite"])
+    assert (retrieved_out / "a.nc").read_text() == "payload"
+    assert (retrieved_out / "store.zarr" / "nested.nc").read_text() == "zarr payload"
+
+print("packems-backed smoke passed")
 PY
 else
-    printf 'zstd not installed; skipped pack/unpack smoke\n'
+    printf 'zstd not installed; skipped packems-backed smoke\n'
 fi

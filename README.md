@@ -1,9 +1,15 @@
 # Archive2Tape
 
-Levante helper for packing selected model-output files to `tar.zst`,
-archiving them to DKRZ HSM tape, retrieving them back to scratch, and unpacking them
-while preserving the source directory tree.
+Levante helper for compressing selected model-output files, then using Packems to
+pack, index, archive, retrieve, and unpack them through DKRZ HSM tape.
 
+`archive2tape` keeps a small beginner-friendly interface around the maintained
+ESM tools:
+
+- local stage: select paths and compress them into `WORK_DIR/compressed`
+- tape stage: `packems` creates tar objects, archives them, and writes `INDEX.txt`
+- restore stage: `unpackems` retrieves the compressed staging tree, then
+  `archive2tape unpack` decompresses it into the target tree
 
 ## Setup
 
@@ -13,17 +19,16 @@ Add this directory to your `PATH`:
 export PATH="/path/to/archive2tape/:$PATH"
 ```
 
-Before using tape commands on Levante:
+Before running `archive2tape` commands on Levante:
 
 ```bash
-module load slk
-slk login
+module load packems
+tapeinit
 ```
 
-`slk login` creates a token in `~/.slk/config.json`. The token is valid for about
-30 days.
+`tapeinit` checks or renews the StrongLink token used by Packems.
 
-Optional user defaults can live in a small config file:
+Optional user defaults can live in a config file:
 
 ```bash
 # archive2tape.conf
@@ -37,44 +42,38 @@ INCLUDE_HIDDEN=0
 ```
 
 Use it with `--config archive2tape.conf`. CLI flags override config values. The
-config parser accepts only known `KEY=VALUE` lines and does not `source` the file,
-so shell code in the config is rejected instead of executed.
+config parser accepts only known `KEY=VALUE` lines and rejects shell code.
 
 ## Beginner Workflow
-
-Terminology: DKRZ documentation calls archive directories "namespaces". This tool
-uses `ARCHIVE_DIR` in help and examples because it is easier to understand; it
-means the same destination path, e.g. `/arch/<project>/<user>/<dataset>`.
 
 Archive selected files from `model_output_dir`:
 
 ```bash
-PROJECT=ab1234  # replace with your project
+PROJECT=ab1234
 archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
   --project "$PROJECT" \
   --work "$GRAVEYARD/my_run"
 ```
 
-Start retrieval and unpack later:
+Start retrieval later:
 
 ```bash
-PROJECT=ab1234  # replace with your project
+PROJECT=ab1234
 archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive \
   --project "$PROJECT" \
   --work "$GRAVEYARD/my_run"
 ```
 
-The `get` command starts retrieval. Retrieval from tape is asynchronous; when the
-complete `.tar.zst` files are present in the work directory, run the printed
-`unpack` command. `get` does not wait for tape recall to finish.
+`get` runs `unpackems` to restore the compressed staging tree from the Packems
+`INDEX.txt`. When retrieval is complete, run the printed `archive2tape unpack`
+command to decompress into `model_output_from_archive`.
 
 ## Stage Commands
 
-Use stage commands when a job failed, when disk space is tight, or when integrating
-with existing scripts:
+Use stage commands when debugging, restarting, or integrating with scripts:
 
 ```bash
-PROJECT=ab1234  # replace with your project
+PROJECT=ab1234
 archive2tape pack model_output_dir "$GRAVEYARD/my_run" --project "$PROJECT"
 archive2tape archive "$GRAVEYARD/my_run" "/arch/$PROJECT/$USER/my_run" --project "$PROJECT"
 
@@ -84,12 +83,26 @@ archive2tape unpack "$GRAVEYARD/my_run" model_output_from_archive
 
 Meanings:
 
-- `put`: `pack` plus `archive`
-- `get`: starts `retrieve` plus prints the exact `unpack` command
-- `pack`: selected files to local/graveyard `.tar.zst`
-- `archive`: existing `.tar.zst` objects to tape
-- `retrieve`: existing `.tar.zst` objects from tape to local/graveyard storage
-- `unpack`: local `.tar.zst` objects into a target directory
+- `put`: `pack` plus Packems archive
+- `get`: `retrieve` plus printed `unpack` command
+- `pack`: select source paths and compress them into `WORK_DIR/compressed`
+- `archive`: use Packems on `WORK_DIR/compressed`
+- `retrieve`: use `unpackems` and Packems `INDEX.txt`
+- `unpack`: decompress restored staging files into a target directory
+
+## Data Layout
+
+In `WORK_DIR/compressed`:
+
+- regular files become relative-path-preserving `*.zst` files
+- selected directories, such as `.zarr` stores, become `relative/path.tar.zst`
+- `archive2tape_manifest.tsv` records type, original size, source relative path,
+  and compressed relative path
+- `archive2tape_metadata.env` records project, source, archive, and include info
+
+Packems then packs and archives the `compressed` directory. The archive namespace
+contains Packems tar objects and `INDEX.txt`, so `listems`/`unpackems` can inspect
+and restore the contents without local `.slurm` logs.
 
 ## Selected Files
 
@@ -107,7 +120,6 @@ Default include patterns:
 Add more patterns with repeated `--include` flags:
 
 ```bash
-PROJECT=ab1234  # replace with your project
 archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
   --project "$PROJECT" \
   --work "$GRAVEYARD/my_run" \
@@ -115,11 +127,27 @@ archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
 ```
 
 Hidden paths are skipped by default so `.git`, `.ssh`, `.ipynb_checkpoints`, and
-similar files are not archived accidentally. Use `--include-hidden` only when you
-know you need those files. Zarr metadata inside a selected `.zarr` directory is
-kept because the whole store is packed. If a selected directory such as
-`Meteogram_run.zarr` matches, descendants inside it are not added separately to
-the tar list.
+similar files are not archived accidentally. Use `--include-hidden` only when
+needed. If a selected directory such as `Meteogram_run.zarr` matches, descendants
+inside it are not selected separately.
+
+## Packems Choices
+
+`archive2tape archive` runs Packems in two phases:
+
+```bash
+packems ... --no-archive compressed
+packems ... --archive-only compressed
+```
+
+This keeps compression separate from HSM upload and uses Packems restart/index
+behavior for the tape-facing work. Defaults follow DKRZ guidance:
+
+- target tar object size: `PACKEMS_TARGET_GB=100`
+- hard max object size: `PACKEMS_MAX_GB=200`
+- parallel jobs: `PACKEMS_JOBS=4`
+
+Override these through environment variables if needed.
 
 ## Safety Checks
 
@@ -130,100 +158,34 @@ The tool fails early when:
 - `--project` does not match the project in the `/arch/...` path
 - the work directory is outside `/scratch` without `--allow-non-scratch-work`
 - no selected files are found
-- a local tar object already exists without `--overwrite`
-- multiple local `*.tar.zst` files exist without an `archive2tape_archive_objects.txt`
-  manifest, unless `--all-objects` is passed explicitly
+- compressed outputs or decompressed targets already exist without `--overwrite`
 
 Use `--dry-run` before submitting jobs:
 
 ```bash
-PROJECT=ab1234  # replace with your project
 archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
   --project "$PROJECT" \
   --work "$GRAVEYARD/my_run" \
   --dry-run
 ```
 
-The dry run prints selected entry count, total selected size, planned tar object,
-manifests, work directory, `ARCHIVE_DIR`, and project.
+## Legacy Archives
 
-Use one work directory per archive set when possible. If a work directory is reused,
-the generated `archive2tape_archive_objects.txt` controls which tar object belongs
-to the current archive/restore. Extra tarballs in the same directory are ignored
-when a manifest is present.
-
-## DKRZ HSM Notes
-
-DKRZ recommends:
-
-- run `slk archive` and retrieval jobs on `shared` or `interactive`, not login
-  nodes, for more than a few GB
-- allocate about 6 GB memory for `slk archive` and retrieval commands
-- avoid archiving many files below 1 GB; pack small files together
-- aim for archive objects around 10-200 GB when possible
-- avoid more than about 3 TB in one archive call
-- avoid too many parallel `slk archive` commands; this tool archives sequentially
-  in one Slurm job by default
-
-This first version creates one `.tar.zst` object per archive set. It warns when
-the planned object is outside the ideal DKRZ size range and requires `--allow-huge`
-above 3 TiB. It does not split a single huge model-output file because split
-restore adds fragility.
-
-## Output Files
-
-In the work directory:
-
-- `<dataset>_0001.tar.zst`: packed data
-- `archive2tape_manifest.tsv`: selected entries with type, size, and relative path
-- `archive2tape_tar_paths.txt`: paths passed to `tar`
-- `archive2tape_metadata.env`: archive metadata and restore hints
-- `archive2tape_archive_objects.txt`: files sent to HSM
-- `.slurm/`: Slurm logs
-
-The tarball stores relative paths from `model_output_dir`, so unpacking into
-`model_output_from_archive` preserves the source tree below that target.
-
-Keep the metadata and manifest files with the tar object. They are archived along
-with the data and are used to avoid accidentally archiving or unpacking stale
-tarballs from a reused work directory.
-
-## Troubleshooting
-
-If packing fails, inspect:
-
-```bash
-less "$GRAVEYARD/my_run/.slurm/pack_<jobid>.err"
-```
-
-If archiving fails, inspect:
-
-```bash
-less "$GRAVEYARD/my_run/.slurm/archive_<jobid>.err"
-less ~/.slk/slk-cli.log
-```
-
-For failed HSM archival, DKRZ recommends rerunning the same archive command. Missing
-or incomplete files are archived again; complete matching files are skipped.
-
-If retrieval uses watchers, the command prints `WATCHER_DIR`. Check `recall.log`
-and `retrieve.log` there.
-
-For cold restores where local metadata is not available, retrieval falls back to
-listing `.tar.zst` objects in the archive namespace. Prefer keeping the generated
-metadata in the work directory when restarting a retrieve/unpack workflow.
+Archives created by earlier `archive2tape` versions as plain `.tar.zst` blobs are
+not Packems-indexed. Restore those with the old workflow or manual
+`slk_helpers` retrieval. New Packems-backed archives should use `get`/`retrieve`
+plus `unpack`.
 
 ## Local Checks
 
-Run local syntax and fixture checks after editing the tool:
+Run local syntax, config, stubbed Packems, and compression round-trip checks:
 
 ```bash
-bash scripts/archive2tape/test_archive2tape.sh
+bash share/archive2tape/test_archive2tape.sh
 ```
 
-The test covers config parsing, hidden-file exclusion, `.zarr` selection without
-duplicate nested entries, stale tarball guards, manifest-scoped unpack dry-runs,
-and a real pack/unpack smoke test when `zstd` is installed.
+The Packems tests use local stub binaries, so they do not require Levante or HSM
+access.
 
 ## Options
 
@@ -234,15 +196,13 @@ and a real pack/unpack smoke test when `zstd` is installed.
 --work WORK_DIR                Work dir for put/get; defaults to $GRAVEYARD/<dataset>
 --include GLOB                 Add selected pattern
 --include-hidden               Allow hidden paths during selection
---dry-run                      Print plan without submitting or unpacking
---run-now                      Run pack/archive/unpack worker in the current shell
---all-objects                  Without a manifest, archive/unpack all local *.tar.zst objects
+--dry-run                      Print plan without submitting or decompressing
+--run-now                      Run stage worker in the current shell
 --allow-non-scratch-work       Allow work dir outside /scratch
---allow-huge                   Allow archive object plan above 3 TiB
---overwrite                    Replace existing local tar object
+--allow-huge                   Allow selected source plan above 3 TiB
+--overwrite                    Replace existing local compressed/decompressed files
 --log-dir DIR                  Slurm log dir; default WORK_DIR/.slurm
 ```
 
-Use `--run-now` only in an interactive/compute allocation for `pack` or `archive`.
-It is intentionally rejected for `retrieve` and `get`; retrieval should use the
-Slurm-backed `slk_helpers` workflow.
+Use `--run-now` only in an interactive/compute allocation for real Packems
+archive/retrieve commands.

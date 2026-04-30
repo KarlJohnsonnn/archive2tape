@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 DEFAULT_INCLUDES=("*.nc" "*.zarr" "*.grb" "*.grib" "*.grb2" "*.grib2")
 ONE_GIB=$((1024 * 1024 * 1024))
@@ -32,17 +32,16 @@ Common options:
   --work WORK_DIR                Work dir for put/get; defaults to $GRAVEYARD/<dataset>
   --include GLOB                 Add selected pattern; defaults include nc, zarr, grib
   --include-hidden               Allow hidden paths when selecting files
-  --dry-run                      Print plan without submitting or unpacking
-  --run-now                      Run pack/archive/unpack worker in current shell
-  --all-objects                  Without a manifest, archive/unpack all local *.tar.zst objects
+  --dry-run                      Print plan without submitting or decompressing
+  --run-now                      Run stage worker in current shell
   --allow-non-scratch-work       Allow work dir outside /scratch
-  --allow-huge                   Allow archive object plan above 3 TiB
-  --overwrite                    Replace existing local tar object
+  --allow-huge                   Allow selected source plan above 3 TiB
+  --overwrite                    Replace existing local compressed/decompressed files
   --log-dir DIR                  Slurm log dir; default WORK_DIR/.slurm
   --help                         Show this help
 
 Beginner workflow:
-    PROJECT=ab1234  # replace with your project
+    PROJECT=ab1234
     archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" --project "$PROJECT" --work "$GRAVEYARD/my_run"
     archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive --project "$PROJECT" --work "$GRAVEYARD/my_run"
 EOF
@@ -79,7 +78,6 @@ archive_project() {
     printf '%s\n' "$project"
 }
 
-# DKRZ calls archive directories "namespaces"; user-facing text says ARCHIVE_DIR.
 validate_archive_ns() {
     local ns="$1" project="$2" ns_project
     ns_project="$(archive_project "$ns")" || die "ARCHIVE_DIR must look like /arch/<project>/... (got '$ns')."
@@ -125,6 +123,11 @@ resolve_put_get_work_dir() {
     printf '%s/%s\n' "${GRAVEYARD%/}" "$dataset"
 }
 
+compressed_dir() { printf '%s/compressed\n' "${1%/}"; }
+retrieved_compressed_dir() { printf '%s/retrieved/compressed\n' "${1%/}"; }
+packems_work_dir() { printf '%s/packems\n' "${1%/}"; }
+unpackems_work_dir() { printf '%s/unpackems\n' "${1%/}"; }
+
 path_matches_include() {
     local rel="$1" pattern
     for pattern in "${INCLUDES[@]}"; do
@@ -156,11 +159,19 @@ path_size() {
     fi
 }
 
+compressed_rel_path() {
+    local type="$1" rel="$2"
+    if [[ "$type" == dir ]]; then
+        printf '%s.tar.zst\n' "$rel"
+    else
+        printf '%s.zst\n' "$rel"
+    fi
+}
+
 collect_selected_paths() {
-    local source_dir="$1" tar_list="$2" manifest="$3"
-    local rel path type size
+    local source_dir="$1" manifest="$2"
+    local rel path type size compressed_rel
     local selected_dirs=()
-    : > "$tar_list"
     : > "$manifest"
     while IFS= read -r -d '' path; do
         rel="${path#./}"
@@ -178,8 +189,8 @@ collect_selected_paths() {
             type="file"
         fi
         size="$(path_size "$source_dir/$rel")"
-        printf '%s\n' "$rel" >> "$tar_list"
-        printf '%s\t%s\t%s\n' "$type" "$size" "$rel" >> "$manifest"
+        compressed_rel="$(compressed_rel_path "$type" "$rel")"
+        printf '%s\t%s\t%s\t%s\n' "$type" "$size" "$rel" "$compressed_rel" >> "$manifest"
     done < <(
         cd "$source_dir"
         find . -mindepth 1 -print0
@@ -187,7 +198,7 @@ collect_selected_paths() {
 }
 
 write_metadata() {
-    local metadata="$1" source_dir="$2" archive_ns="$3" project="$4" account="$5" tar_object="$6" total_bytes="$7"
+    local metadata="$1" source_dir="$2" archive_ns="$3" project="$4" account="$5" total_bytes="$6"
     {
         printf 'ARCHIVE2TAPE_VERSION=%s\n' "$VERSION"
         printf 'CREATED_UTC=%s\n' "$(utc_now)"
@@ -196,128 +207,70 @@ write_metadata() {
         printf 'SOURCE_DIR=%s\n' "$source_dir"
         printf 'SOURCE_BASENAME=%s\n' "$(basename "$source_dir")"
         printf 'ARCHIVE_DIR=%s\n' "$archive_ns"
-        printf 'TAR_OBJECT=%s\n' "$(basename "$tar_object")"
         printf 'TOTAL_BYTES=%s\n' "$total_bytes"
         printf 'INCLUDE_PATTERNS=%s\n' "${INCLUDES[*]}"
+        printf 'COMPRESSED_SUBDIR=compressed\n'
     } > "$metadata"
 }
 
 print_size_warnings() {
     local total_bytes="$1" allow_huge="$2"
     if (( total_bytes < ONE_GIB )); then
-        warn "Planned archive object is below 1 GiB ($(human_bytes "$total_bytes")); tape quota/retrieval may be inefficient."
+        warn "Selected source data is below 1 GiB ($(human_bytes "$total_bytes")); tape quota/retrieval may be inefficient."
     elif (( total_bytes < TEN_GIB )); then
-        warn "Planned archive object is below DKRZ's ideal 10-200 GiB range ($(human_bytes "$total_bytes"))."
+        warn "Selected source data is below DKRZ's ideal 10-200 GiB object range ($(human_bytes "$total_bytes"))."
     elif (( total_bytes > TWO_HUNDRED_GIB )); then
-        warn "Planned archive object is above DKRZ's ideal 10-200 GiB range ($(human_bytes "$total_bytes"))."
+        warn "Selected source data is above DKRZ's ideal 10-200 GiB object range ($(human_bytes "$total_bytes")); Packems will split packed objects."
     fi
     if (( total_bytes > THREE_TIB && allow_huge != 1 )); then
-        die "Planned archive object is above 3 TiB ($(human_bytes "$total_bytes")). Re-run with --allow-huge if intentional."
+        die "Selected source plan is above 3 TiB ($(human_bytes "$total_bytes")). Re-run with --allow-huge if intentional."
     fi
 }
 
-prepare_pack_plan() {
+prepare_compress_plan() {
     local source_dir="$1" work_dir="$2" archive_ns="$3" project="$4" account="$5" dry_run="$6"
-    local dataset tar_object tar_list manifest metadata archive_manifest total_bytes file_count
+    local manifest metadata total_bytes file_count out_dir
     source_dir="$(dir_abs "$source_dir")"
-    dataset="$(basename "${archive_ns:-$source_dir}")"
-    dataset="${dataset%/}"
-    tar_object="$work_dir/${dataset}_0001.tar.zst"
-    tar_list="$work_dir/archive2tape_tar_paths.txt"
-    manifest="$work_dir/archive2tape_manifest.tsv"
-    metadata="$work_dir/archive2tape_metadata.env"
-    archive_manifest="$work_dir/archive2tape_archive_objects.txt"
+    out_dir="$(compressed_dir "$work_dir")"
+    manifest="$out_dir/archive2tape_manifest.tsv"
+    metadata="$out_dir/archive2tape_metadata.env"
 
     if [[ "$dry_run" -eq 1 ]]; then
         local tmp_dir
         tmp_dir="$(mktemp -d)"
-        tar_list="$tmp_dir/tar_paths.txt"
-        manifest="$tmp_dir/manifest.tsv"
-        archive_manifest="$tmp_dir/archive_objects.txt"
+        manifest="$tmp_dir/archive2tape_manifest.tsv"
     else
-        mkdir -p "$work_dir"
+        mkdir -p "$out_dir"
     fi
 
-    collect_selected_paths "$source_dir" "$tar_list" "$manifest"
-    file_count="$(line_count "$tar_list")"
+    collect_selected_paths "$source_dir" "$manifest"
+    file_count="$(line_count "$manifest")"
     [[ "$file_count" -gt 0 ]] || die "No selected files found below '$source_dir'. Add --include PATTERN if needed."
     total_bytes="$(sum_second_column "$manifest")"
     print_size_warnings "$total_bytes" "$ALLOW_HUGE"
 
     if [[ "$dry_run" -ne 1 ]]; then
-        write_metadata "$metadata" "$source_dir" "$archive_ns" "$project" "$account" "$tar_object" "$total_bytes"
-        {
-            printf '%s\n' "$tar_object"
-            printf '%s\n' "$manifest"
-            printf '%s\n' "$tar_list"
-            printf '%s\n' "$metadata"
-        } > "$archive_manifest"
+        write_metadata "$metadata" "$source_dir" "$archive_ns" "$project" "$account" "$total_bytes"
     fi
 
     info "SOURCE_DIR=$source_dir"
     info "WORK_DIR=$work_dir"
+    info "COMPRESSED_DIR=$out_dir"
     [[ -n "$archive_ns" ]] && info "ARCHIVE_DIR=$archive_ns"
     [[ -n "$project" ]] && info "PROJECT=$project"
     [[ -n "$account" ]] && info "ACCOUNT=$account"
     info "SELECTED_ENTRIES=$file_count"
     info "SELECTED_SIZE=$(human_bytes "$total_bytes")"
-    info "TAR_OBJECT=$tar_object"
     info "MANIFEST=$manifest"
-    info "TAR_LIST=$tar_list"
-    info "ARCHIVE_OBJECTS=$archive_manifest"
 }
 
-create_archive_manifest_from_work_dir() {
-    local work_dir="$1" archive_manifest="$2" tar_count tar_file
-    local tar_files=()
-    if [[ -s "$archive_manifest" ]]; then
-        validate_archive_manifest_files "$archive_manifest"
-        warn_for_extra_tar_objects "$work_dir" "$archive_manifest"
-        return
-    fi
-    while IFS= read -r tar_file; do
-        tar_files+=("$tar_file")
-    done < <(find "$work_dir" -maxdepth 1 -type f -name '*.tar.zst' | sort)
-    if [[ "${#tar_files[@]}" -gt 1 && "$ALL_OBJECTS" -ne 1 ]]; then
-        die "Multiple .tar.zst files found in '$work_dir'. Use existing archive2tape_archive_objects.txt or pass --all-objects."
-    fi
-    : > "$archive_manifest"
-    ((${#tar_files[@]} > 0)) && printf '%s\n' "${tar_files[@]}" >> "$archive_manifest"
-    for meta in archive2tape_manifest.tsv archive2tape_tar_paths.txt archive2tape_metadata.env; do
-        [[ -f "$work_dir/$meta" ]] && printf '%s\n' "$work_dir/$meta" >> "$archive_manifest"
-    done
-    tar_count="$(grep -c '\.tar\.zst$' "$archive_manifest" || true)"
-    [[ "$tar_count" -gt 0 ]] || die "No .tar.zst files found in '$work_dir'."
-    validate_archive_manifest_files "$archive_manifest"
-}
-
-validate_archive_manifest_files() {
-    local archive_manifest="$1" path tar_count=0
-    [[ -f "$archive_manifest" ]] || die "Missing archive object manifest: $archive_manifest"
-    while IFS= read -r path; do
-        [[ -n "$path" ]] || continue
-        [[ -f "$path" ]] || die "Manifest object is missing locally: $path"
-        [[ "$path" == *.tar.zst ]] && tar_count=$((tar_count + 1))
-    done < "$archive_manifest"
-    [[ "$tar_count" -gt 0 ]] || die "No .tar.zst files listed in '$archive_manifest'."
-}
-
-warn_for_extra_tar_objects() {
-    local work_dir="$1" archive_manifest="$2" tar_file
-    while IFS= read -r tar_file; do
-        if ! grep -Fxq "$tar_file" "$archive_manifest"; then
-            warn "Ignoring extra tar object not listed in manifest: $tar_file"
-        fi
-    done < <(find "$work_dir" -maxdepth 1 -type f -name '*.tar.zst' | sort)
-}
-
-submit_pack_job() {
-    local source_dir="$1" tar_list="$2" tar_object="$3" log_dir="$4" account="$5" job_id
+submit_compress_job() {
+    local source_dir="$1" work_dir="$2" log_dir="$3" account="$4" job_id
     mkdir -p "$log_dir"
     require_cmd sbatch
     job_id="$(
         sbatch --parsable \
-            --job-name=a2t_pack \
+            --job-name=a2t_compress \
             --partition="${PACK_PARTITION:-compute}" \
             --nodes=1 \
             --ntasks=1 \
@@ -325,219 +278,211 @@ submit_pack_job() {
             --time="${PACK_TIME:-04:00:00}" \
             --account="$account" \
             --mem="${PACK_MEM:-16G}" \
-            --output="$log_dir/pack_%j.out" \
-            --error="$log_dir/pack_%j.err" <<EOF
+            --output="$log_dir/compress_%j.out" \
+            --error="$log_dir/compress_%j.err" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-$(shell_quote "$SCRIPT_PATH") __worker_pack $(shell_quote "$source_dir") $(shell_quote "$tar_list") $(shell_quote "$tar_object") $(shell_quote "$OVERWRITE")
+$(shell_quote "$SCRIPT_PATH") __worker_compress $(shell_quote "$source_dir") $(shell_quote "$work_dir") $(shell_quote "$OVERWRITE")
 EOF
     )"
     printf '%s\n' "${job_id%%;*}"
 }
 
-submit_archive_job() {
-    local archive_manifest="$1" archive_ns="$2" log_dir="$3" account="$4" dependency="${5:-}" job_id dep_args=()
+submit_packems_job() {
+    local work_dir="$1" archive_ns="$2" account="$3" dependency="${4:-}" job_id dep_args=()
+    local log_dir="${5:-$(printf '%s/.slurm' "$work_dir")}" dataset
     mkdir -p "$log_dir"
     require_cmd sbatch
+    dataset="$(basename "${archive_ns%/}")"
     [[ -n "$dependency" ]] && dep_args=(--dependency="afterok:$dependency")
     job_id="$(
         sbatch --parsable \
             "${dep_args[@]}" \
-            --job-name=a2t_archive \
+            --job-name=a2t_packems \
             --partition="${ARCHIVE_PARTITION:-shared}" \
             --nodes=1 \
             --ntasks=1 \
-            --cpus-per-task=1 \
+            --cpus-per-task="${PACKEMS_CPUS:-4}" \
             --time="${ARCHIVE_TIME:-08:00:00}" \
             --account="$account" \
             --mem="${ARCHIVE_MEM:-8G}" \
-            --output="$log_dir/archive_%j.out" \
-            --error="$log_dir/archive_%j.err" <<EOF
+            --output="$log_dir/packems_%j.out" \
+            --error="$log_dir/packems_%j.err" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-$(shell_quote "$SCRIPT_PATH") __worker_archive $(shell_quote "$archive_manifest") $(shell_quote "$archive_ns")
+$(shell_quote "$SCRIPT_PATH") __worker_packems_archive $(shell_quote "$work_dir") $(shell_quote "$archive_ns") $(shell_quote "$dataset")
 EOF
     )"
     printf '%s\n' "${job_id%%;*}"
 }
 
-submit_retrieve_job() {
-    local archive_ns="$1" work_dir="$2" log_dir="$3" account="$4" job_id
+submit_unpackems_job() {
+    local archive_ns="$1" work_dir="$2" log_dir="$3" account="$4" job_id dataset
     mkdir -p "$log_dir"
     require_cmd sbatch
+    dataset="$(basename "${archive_ns%/}")"
     job_id="$(
         sbatch --parsable \
-            --job-name=a2t_retrieve \
+            --job-name=a2t_unpackems \
             --partition="${RETRIEVE_PARTITION:-shared}" \
             --nodes=1 \
             --ntasks=1 \
-            --cpus-per-task=1 \
+            --cpus-per-task="${UNPACKEMS_CPUS:-4}" \
             --time="${RETRIEVE_TIME:-08:00:00}" \
             --account="$account" \
             --mem="${RETRIEVE_MEM:-8G}" \
-            --output="$log_dir/retrieve_%j.out" \
-            --error="$log_dir/retrieve_%j.err" <<EOF
+            --output="$log_dir/unpackems_%j.out" \
+            --error="$log_dir/unpackems_%j.err" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-$(shell_quote "$SCRIPT_PATH") __worker_retrieve $(shell_quote "$archive_ns") $(shell_quote "$work_dir") $(shell_quote "$account")
+$(shell_quote "$SCRIPT_PATH") __worker_unpackems $(shell_quote "$archive_ns") $(shell_quote "$work_dir") $(shell_quote "$dataset")
 EOF
     )"
     printf '%s\n' "${job_id%%;*}"
 }
 
-load_levante_and_slk() {
+load_packems() {
     [[ -f /sw/etc/profile.levante ]] && . /sw/etc/profile.levante
-    command -v module >/dev/null 2>&1 && module load slk >/dev/null 2>&1 || true
-    require_cmd slk
-    require_cmd slk_helpers
-    [[ -f "${HOME}/.slk/config.json" ]] || die "Run 'module load slk && slk login' first."
+    if command -v module >/dev/null 2>&1; then
+        module load packems >/dev/null 2>&1 || true
+    fi
+    require_cmd tapeinit
+    require_cmd packems
+    require_cmd unpackems
+    tapeinit
 }
 
-worker_pack() {
-    local source_dir="$1" tar_list="$2" tar_object="$3" overwrite="$4" tmp_object threads
+worker_compress() {
+    local source_dir="$1" work_dir="$2" overwrite="$3" manifest out_dir type size rel compressed_rel
+    local src dst tmp threads parent name
     require_cmd tar
     require_cmd zstd
+    source_dir="$(dir_abs "$source_dir")"
+    out_dir="$(compressed_dir "$work_dir")"
+    manifest="$out_dir/archive2tape_manifest.tsv"
     [[ -d "$source_dir" ]] || die "Missing source dir: $source_dir"
-    [[ -f "$tar_list" ]] || die "Missing tar path list: $tar_list"
-    if [[ -e "$tar_object" && "$overwrite" -ne 1 ]]; then
-        die "Tar object exists: $tar_object (use --overwrite to replace)"
-    fi
-    mkdir -p "$(dirname "$tar_object")"
-    tmp_object="${tar_object}.tmp.$$"
-    rm -f "$tmp_object"
-    trap 'rm -f "$tmp_object"' EXIT
+    [[ -f "$manifest" ]] || die "Missing manifest: $manifest"
     threads="${SLURM_CPUS_PER_TASK:-1}"
-    tar -C "$source_dir" -cf - -T "$tar_list" | zstd -T"$threads" -9 -o "$tmp_object"
-    mv "$tmp_object" "$tar_object"
-    trap - EXIT
-    info "PACKED=$tar_object"
+    while IFS=$'\t' read -r type size rel compressed_rel; do
+        [[ -n "$rel" ]] || continue
+        src="$source_dir/$rel"
+        dst="$out_dir/$compressed_rel"
+        mkdir -p "$(dirname "$dst")"
+        if [[ -e "$dst" && "$overwrite" -ne 1 ]]; then
+            die "Compressed object exists: $dst (use --overwrite to replace)"
+        fi
+        tmp="${dst}.tmp.$$"
+        rm -f "$tmp"
+        if [[ "$type" == dir ]]; then
+            [[ -d "$src" ]] || die "Missing selected directory: $src"
+            parent="$(dirname "$src")"
+            name="$(basename "$src")"
+            tar -C "$parent" -cf - "$name" | zstd -T"$threads" -9 -o "$tmp"
+        else
+            [[ -f "$src" ]] || die "Missing selected file: $src"
+            zstd -T"$threads" -9 -c "$src" > "$tmp"
+        fi
+        mv "$tmp" "$dst"
+        info "COMPRESSED=$dst"
+    done < "$manifest"
 }
 
-worker_archive() {
-    local archive_manifest="$1" archive_ns="${2%/}/" code path
-    local files=()
-    while IFS= read -r path; do
-        [[ -n "$path" ]] && files+=("$path")
-    done < "$archive_manifest"
-    [[ "${#files[@]}" -gt 0 ]] || die "Archive manifest is empty: $archive_manifest"
-    load_levante_and_slk
-    set +e
-    slk archive -vv "${files[@]}" "$archive_ns"
-    code=$?
-    set -e
-    if [[ "$code" -ne 0 ]]; then
-        warn "slk archive failed with exit code $code. Re-run the same archive command after checking ~/.slk/slk-cli.log."
-    fi
-    return "$code"
+worker_packems_archive() {
+    local work_dir="$1" archive_ns="$2" dataset="$3" out_dir pack_dir target max jobs
+    out_dir="$(compressed_dir "$work_dir")"
+    pack_dir="$(packems_work_dir "$work_dir")"
+    [[ -d "$out_dir" ]] || die "Missing compressed staging dir: $out_dir"
+    mkdir -p "$pack_dir"
+    load_packems
+    target="${PACKEMS_TARGET_GB:-100}"
+    max="${PACKEMS_MAX_GB:-200}"
+    jobs="${PACKEMS_JOBS:-4}"
+    (
+        cd "$work_dir"
+        packems -d "$pack_dir" -S "$archive_ns" -o "$dataset" -t "$target" -m "$max" -j "$jobs" --no-archive compressed
+        packems -d "$pack_dir" -S "$archive_ns" -o "$dataset" -t "$target" -m "$max" -j "$jobs" --archive-only compressed
+    )
+    info "PACKEMS_INDEX=${archive_ns%/}/INDEX.txt"
 }
 
-list_remote_tar_objects() {
-    local archive_ns="${1%/}"
-    slk list "$archive_ns" | awk -v ns="$archive_ns" '
-        /\.tar\.zst/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /\.tar\.zst$/) print ns "/" $i
-            }
-        }
-    '
-}
-
-expected_remote_tar_objects() {
-    local archive_ns="${1%/}" work_dir="$2" metadata="$2/archive2tape_metadata.env" archive_manifest="$2/archive2tape_archive_objects.txt"
-    local tar_object path count=0
-    if [[ -f "$metadata" ]]; then
-        tar_object="$(awk -F= '$1 == "TAR_OBJECT" {print $2; exit}' "$metadata")"
-        [[ -n "$tar_object" ]] && { printf '%s/%s\n' "$archive_ns" "$tar_object"; return 0; }
-    fi
-    if [[ -f "$archive_manifest" ]]; then
-        while IFS= read -r path; do
-            if [[ "$path" == *.tar.zst ]]; then
-                printf '%s/%s\n' "$archive_ns" "$(basename "$path")"
-                count=$((count + 1))
-            fi
-        done < "$archive_manifest"
-        [[ "$count" -gt 0 ]] && return 0
-    fi
-    return 1
-}
-
-worker_retrieve() {
-    local archive_ns="$1" work_dir="$2" account="$3" count watcher_dir object
-    local objects=()
-    mkdir -p "$work_dir"
-    load_levante_and_slk
-    while IFS= read -r object; do
-        [[ -n "$object" ]] && objects+=("$object")
-    done < <(expected_remote_tar_objects "$archive_ns" "$work_dir" || list_remote_tar_objects "$archive_ns")
-    count="${#objects[@]}"
-    [[ "$count" -gt 0 ]] || die "No .tar.zst objects found in ARCHIVE_DIR: $archive_ns"
-    if (( count <= 4 )); then
-        slk_helpers recall "${objects[@]}" -d "$work_dir"
-        slk_helpers retrieve "${objects[@]}" -d "$work_dir" -v --slurm "$account"
-    else
-        watcher_dir="$work_dir/archive2tape_watchers_$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "$watcher_dir"
-        (
-            cd "$watcher_dir"
-            slk_helpers init_watchers "${objects[@]}" -d "$work_dir" -ns
-            slk_helpers start_watchers "$account"
-        )
-        info "WATCHER_DIR=$watcher_dir"
-    fi
-    info "Retrieval started. After retrieved .tar.zst files are present, run:"
+worker_unpackems() {
+    local archive_ns="$1" work_dir="$2" dataset="$3" retrieved work index
+    retrieved="$work_dir/retrieved"
+    work="$(unpackems_work_dir "$work_dir")"
+    index="t:${archive_ns%/}/INDEX.txt"
+    mkdir -p "$retrieved" "$work"
+    load_packems
+    unpackems -i "$index" -d "$retrieved" -w "$work" -f 'compressed/*'
+    info "RETRIEVED_COMPRESSED_DIR=$retrieved/compressed"
+    info "After retrieval, run:"
     info "  archive2tape unpack $(shell_quote "$work_dir") TARGET_DIR"
 }
 
-worker_unpack() {
-    local work_dir="$1" target_dir="$2" archive_manifest="${3:-$1/archive2tape_archive_objects.txt}" all_objects="${4:-0}" tar_file count=0
-    local tar_files=()
+select_compressed_root() {
+    local work_dir="$1" local_root retrieved_root
+    local_root="$(compressed_dir "$work_dir")"
+    retrieved_root="$(retrieved_compressed_dir "$work_dir")"
+    if [[ -f "$retrieved_root/archive2tape_manifest.tsv" ]]; then
+        printf '%s\n' "$retrieved_root"
+    elif [[ -f "$local_root/archive2tape_manifest.tsv" ]]; then
+        printf '%s\n' "$local_root"
+    else
+        die "No compressed staging manifest found below '$work_dir'. Expected compressed/ or retrieved/compressed/."
+    fi
+}
+
+worker_decompress() {
+    local work_dir="$1" target_dir="$2" overwrite="${3:-0}" root manifest type size rel compressed_rel
+    local src dst tmp count=0
     require_cmd tar
     require_cmd zstd
+    root="$(select_compressed_root "$work_dir")"
+    manifest="$root/archive2tape_manifest.tsv"
     mkdir -p "$target_dir"
-    while IFS= read -r tar_file; do
-        [[ -n "$tar_file" ]] && tar_files+=("$tar_file")
-    done < <(select_local_tar_objects "$work_dir" "$archive_manifest" "$all_objects")
-    if ((${#tar_files[@]} > 0)); then
-        for tar_file in "${tar_files[@]}"; do
-            count=$((count + 1))
-            zstd -dc "$tar_file" | tar -xf - -C "$target_dir"
-            info "UNPACKED=$tar_file"
-        done
-    fi
-    [[ "$count" -gt 0 ]] || die "No .tar.zst files found in '$work_dir'."
+    while IFS=$'\t' read -r type size rel compressed_rel; do
+        [[ -n "$rel" ]] || continue
+        src="$root/$compressed_rel"
+        [[ -f "$src" ]] || die "Missing compressed object: $src"
+        if [[ "$type" == dir ]]; then
+            dst="$target_dir/$rel"
+            [[ ! -e "$dst" || "$overwrite" -eq 1 ]] || die "Target directory exists: $dst (use --overwrite to replace)"
+            zstd -dc "$src" | tar -xf - -C "$target_dir"
+        else
+            dst="$target_dir/$rel"
+            [[ ! -e "$dst" || "$overwrite" -eq 1 ]] || die "Target file exists: $dst (use --overwrite to replace)"
+            mkdir -p "$(dirname "$dst")"
+            tmp="${dst}.tmp.$$"
+            rm -f "$tmp"
+            zstd -dc "$src" > "$tmp"
+            mv "$tmp" "$dst"
+        fi
+        count=$((count + 1))
+        info "DECOMPRESSED=$dst"
+    done < "$manifest"
+    [[ "$count" -gt 0 ]] || die "Manifest has no entries: $manifest"
 }
 
-select_local_tar_objects() {
-    local work_dir="$1" archive_manifest="$2" all_objects="$3"
-    local tar_file
-    local tar_files=()
-    if [[ -s "$archive_manifest" ]]; then
-        while IFS= read -r tar_file; do
-            [[ "$tar_file" == *.tar.zst ]] || continue
-            [[ -f "$tar_file" ]] || die "Manifest tar object is missing locally: $tar_file"
-            printf '%s\n' "$tar_file"
-        done < "$archive_manifest"
-        return
-    fi
-    while IFS= read -r tar_file; do
-        tar_files+=("$tar_file")
-    done < <(find "$work_dir" -maxdepth 1 -type f -name '*.tar.zst' | sort)
-    if [[ "${#tar_files[@]}" -gt 1 && "$all_objects" -ne 1 ]]; then
-        die "Multiple .tar.zst files found in '$work_dir'. Pass --all-objects if all belong to this restore."
-    fi
-    ((${#tar_files[@]} > 0)) && printf '%s\n' "${tar_files[@]}"
+dry_run_packems_archive() {
+    local work_dir="$1" archive_ns="$2" dataset
+    dataset="$(basename "${archive_ns%/}")"
+    info "WORK_DIR=$work_dir"
+    info "COMPRESSED_DIR=$(compressed_dir "$work_dir")"
+    info "ARCHIVE_DIR=$archive_ns"
+    info "PACKEMS_INDEX=${archive_ns%/}/INDEX.txt"
+    info "Would run:"
+    info "  tapeinit"
+    info "  packems -d $(shell_quote "$(packems_work_dir "$work_dir")") -S $(shell_quote "$archive_ns") -o $(shell_quote "$dataset") -t ${PACKEMS_TARGET_GB:-100} -m ${PACKEMS_MAX_GB:-200} -j ${PACKEMS_JOBS:-4} --no-archive compressed"
+    info "  packems -d $(shell_quote "$(packems_work_dir "$work_dir")") -S $(shell_quote "$archive_ns") -o $(shell_quote "$dataset") -t ${PACKEMS_TARGET_GB:-100} -m ${PACKEMS_MAX_GB:-200} -j ${PACKEMS_JOBS:-4} --archive-only compressed"
 }
 
-dry_run_remote_objects() {
+dry_run_unpackems() {
     local archive_ns="$1" work_dir="$2"
-    if expected_remote_tar_objects "$archive_ns" "$work_dir"; then
-        return
-    fi
-    if command -v slk >/dev/null 2>&1 && [[ -f "${HOME}/.slk/config.json" ]]; then
-        list_remote_tar_objects "$archive_ns" || true
-    else
-        info "(remote listing skipped: slk login not available in this environment)"
-    fi
+    info "ARCHIVE_DIR=$archive_ns"
+    info "WORK_DIR=$work_dir"
+    info "RETRIEVED_COMPRESSED_DIR=$(retrieved_compressed_dir "$work_dir")"
+    info "Would run:"
+    info "  tapeinit"
+    info "  unpackems -i t:${archive_ns%/}/INDEX.txt -d $(shell_quote "$work_dir/retrieved") -w $(shell_quote "$(unpackems_work_dir "$work_dir")") -f 'compressed/*'"
 }
 
 find_config_arg() {
@@ -624,10 +569,10 @@ fi
 
 COMMAND="${1:-}"
 case "$COMMAND" in
-    __worker_pack) shift; worker_pack "$@"; exit ;;
-    __worker_archive) shift; worker_archive "$@"; exit ;;
-    __worker_retrieve) shift; worker_retrieve "$@"; exit ;;
-    __worker_unpack) shift; worker_unpack "$@"; exit ;;
+    __worker_compress) shift; worker_compress "$@"; exit ;;
+    __worker_packems_archive) shift; worker_packems_archive "$@"; exit ;;
+    __worker_unpackems) shift; worker_unpackems "$@"; exit ;;
+    __worker_decompress) shift; worker_decompress "$@"; exit ;;
 esac
 
 [[ -n "$COMMAND" ]] || { usage; exit 1; }
@@ -646,7 +591,6 @@ ALLOW_NON_SCRATCH_WORK=0
 ALLOW_HUGE=0
 INCLUDE_HIDDEN=0
 OVERWRITE=0
-ALL_OBJECTS=0
 INCLUDES=("${DEFAULT_INCLUDES[@]}")
 POSITIONAL=()
 
@@ -665,7 +609,7 @@ while [[ $# -gt 0 ]]; do
         --include-hidden) INCLUDE_HIDDEN=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --run-now) RUN_NOW=1; shift ;;
-        --all-objects) ALL_OBJECTS=1; shift ;;
+        --all-objects) shift ;;
         --allow-non-scratch-work) ALLOW_NON_SCRATCH_WORK=1; shift ;;
         --allow-huge) ALLOW_HUGE=1; shift ;;
         --overwrite) OVERWRITE=1; shift ;;
@@ -686,19 +630,18 @@ ACCOUNT="${ACCOUNT:-$PROJECT}"
 cmd_pack() {
     [[ "${#POSITIONAL[@]}" -eq 2 ]] || die "Usage: archive2tape pack SOURCE_DIR WORK_DIR --project PROJECT"
     [[ -n "$PROJECT" ]] || die "--project is required for pack."
-    local source_dir="${POSITIONAL[0]}" work_dir="${POSITIONAL[1]}" log_dir job_id source_abs tar_object
+    local source_dir="${POSITIONAL[0]}" work_dir="${POSITIONAL[1]}" log_dir job_id source_abs
     [[ -d "$source_dir" ]] || die "Missing source dir: $source_dir"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
     log_dir="${LOG_DIR:-$work_dir/.slurm}"
-    prepare_pack_plan "$source_dir" "$work_dir" "" "$PROJECT" "$ACCOUNT" "$DRY_RUN"
+    prepare_compress_plan "$source_dir" "$work_dir" "" "$PROJECT" "$ACCOUNT" "$DRY_RUN"
     [[ "$DRY_RUN" -eq 1 ]] && return 0
     source_abs="$(dir_abs "$source_dir")"
-    tar_object="$work_dir/$(basename "$source_abs")_0001.tar.zst"
     if [[ "$RUN_NOW" -eq 1 ]]; then
-        worker_pack "$source_abs" "$work_dir/archive2tape_tar_paths.txt" "$tar_object" "$OVERWRITE"
+        worker_compress "$source_abs" "$work_dir" "$OVERWRITE"
     else
-        job_id="$(submit_pack_job "$source_abs" "$work_dir/archive2tape_tar_paths.txt" "$tar_object" "$log_dir" "$ACCOUNT")"
-        info "PACK_JOB_ID=$job_id"
+        job_id="$(submit_compress_job "$source_abs" "$work_dir" "$log_dir" "$ACCOUNT")"
+        info "COMPRESS_JOB_ID=$job_id"
         info "LOG_DIR=$log_dir"
     fi
 }
@@ -706,35 +649,21 @@ cmd_pack() {
 cmd_archive() {
     [[ "${#POSITIONAL[@]}" -eq 2 ]] || die "Usage: archive2tape archive WORK_DIR ARCHIVE_DIR --project PROJECT"
     [[ -n "$PROJECT" ]] || die "--project is required for archive."
-    local work_dir="${POSITIONAL[0]}" archive_ns="${POSITIONAL[1]}" log_dir archive_manifest job_id
+    local work_dir="${POSITIONAL[0]}" archive_ns="${POSITIONAL[1]}" log_dir job_id
     archive_ns="$(resolve_archive_dir "$archive_ns")"
     validate_archive_ns "$archive_ns" "$PROJECT"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
-    archive_manifest="$work_dir/archive2tape_archive_objects.txt"
     log_dir="${LOG_DIR:-$work_dir/.slurm}"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        info "WORK_DIR=$work_dir"
-        info "ARCHIVE_DIR=$archive_ns"
-        info "PROJECT=$PROJECT"
-        info "ACCOUNT=$ACCOUNT"
-        info "Would archive these local objects:"
-        if [[ -s "$archive_manifest" ]]; then
-            info "OBJECT_SOURCE=$archive_manifest"
-            while IFS= read -r path; do [[ -n "$path" ]] && info "$path"; done < "$archive_manifest"
-        else
-            info "OBJECT_SOURCE=work-dir scan"
-            select_local_tar_objects "$work_dir" "$archive_manifest" "$ALL_OBJECTS" || true
-            find "$work_dir" -maxdepth 1 -type f \( -name 'archive2tape_*.tsv' -o -name 'archive2tape_*.txt' -o -name 'archive2tape_*.env' \) | sort || true
-        fi
+        dry_run_packems_archive "$work_dir" "$archive_ns"
         return 0
     fi
-    create_archive_manifest_from_work_dir "$work_dir" "$archive_manifest"
+    [[ -d "$(compressed_dir "$work_dir")" ]] || die "Missing compressed staging dir: $(compressed_dir "$work_dir"). Run archive2tape pack first."
     if [[ "$RUN_NOW" -eq 1 ]]; then
-        worker_archive "$archive_manifest" "$archive_ns"
+        worker_packems_archive "$work_dir" "$archive_ns" "$(basename "${archive_ns%/}")"
     else
-        job_id="$(submit_archive_job "$archive_manifest" "$archive_ns" "$log_dir" "$ACCOUNT")"
-        info "ARCHIVE_JOB_ID=$job_id"
-        info "ARCHIVE_OBJECTS=$archive_manifest"
+        job_id="$(submit_packems_job "$work_dir" "$archive_ns" "$ACCOUNT" "" "$log_dir")"
+        info "PACKEMS_JOB_ID=$job_id"
         info "LOG_DIR=$log_dir"
     fi
 }
@@ -742,27 +671,25 @@ cmd_archive() {
 cmd_put() {
     [[ "${#POSITIONAL[@]}" -eq 2 ]] || die "Usage: archive2tape put SOURCE_DIR ARCHIVE_DIR --project PROJECT [--work WORK_DIR]"
     [[ -n "$PROJECT" ]] || die "--project is required for put."
-    local source_dir="${POSITIONAL[0]}" archive_ns="${POSITIONAL[1]}" work_dir log_dir pack_job archive_job archive_manifest tar_object source_abs
+    local source_dir="${POSITIONAL[0]}" archive_ns="${POSITIONAL[1]}" work_dir log_dir compress_job packems_job source_abs
     [[ -d "$source_dir" ]] || die "Missing source dir: $source_dir"
     archive_ns="$(resolve_archive_dir "$archive_ns")"
     validate_archive_ns "$archive_ns" "$PROJECT"
     work_dir="$(resolve_put_get_work_dir "$archive_ns" "$WORK")"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
     log_dir="${LOG_DIR:-$work_dir/.slurm}"
-    prepare_pack_plan "$source_dir" "$work_dir" "$archive_ns" "$PROJECT" "$ACCOUNT" "$DRY_RUN"
+    prepare_compress_plan "$source_dir" "$work_dir" "$archive_ns" "$PROJECT" "$ACCOUNT" "$DRY_RUN"
     [[ "$DRY_RUN" -eq 1 ]] && return 0
-    archive_manifest="$work_dir/archive2tape_archive_objects.txt"
-    tar_object="$work_dir/$(basename "${archive_ns%/}")_0001.tar.zst"
     source_abs="$(dir_abs "$source_dir")"
     if [[ "$RUN_NOW" -eq 1 ]]; then
-        worker_pack "$source_abs" "$work_dir/archive2tape_tar_paths.txt" "$tar_object" "$OVERWRITE"
-        worker_archive "$archive_manifest" "$archive_ns"
+        worker_compress "$source_abs" "$work_dir" "$OVERWRITE"
+        worker_packems_archive "$work_dir" "$archive_ns" "$(basename "${archive_ns%/}")"
     else
-        pack_job="$(submit_pack_job "$source_abs" "$work_dir/archive2tape_tar_paths.txt" "$tar_object" "$log_dir" "$ACCOUNT")"
-        archive_job="$(submit_archive_job "$archive_manifest" "$archive_ns" "$log_dir" "$ACCOUNT" "$pack_job")"
-        info "PACK_JOB_ID=$pack_job"
-        info "ARCHIVE_JOB_ID=$archive_job"
-        info "ARCHIVE_DEPENDENCY=afterok:$pack_job"
+        compress_job="$(submit_compress_job "$source_abs" "$work_dir" "$log_dir" "$ACCOUNT")"
+        packems_job="$(submit_packems_job "$work_dir" "$archive_ns" "$ACCOUNT" "$compress_job" "$log_dir")"
+        info "COMPRESS_JOB_ID=$compress_job"
+        info "PACKEMS_JOB_ID=$packems_job"
+        info "PACKEMS_DEPENDENCY=afterok:$compress_job"
         info "LOG_DIR=$log_dir"
     fi
 }
@@ -774,21 +701,19 @@ cmd_retrieve() {
     archive_ns="$(resolve_archive_dir "$archive_ns")"
     validate_archive_ns "$archive_ns" "$PROJECT"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
-    [[ "$RUN_NOW" -eq 1 ]] && die "--run-now is not supported for retrieve/get; use the default Slurm-backed retrieval workflow."
     log_dir="${LOG_DIR:-$work_dir/.slurm}"
-    info "ARCHIVE_DIR=$archive_ns"
-    info "WORK_DIR=$work_dir"
-    info "PROJECT=$PROJECT"
-    info "ACCOUNT=$ACCOUNT"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        info "Would retrieve these remote tar objects:"
-        dry_run_remote_objects "$archive_ns" "$work_dir"
+        dry_run_unpackems "$archive_ns" "$work_dir"
         return 0
     fi
-    job_id="$(submit_retrieve_job "$archive_ns" "$work_dir" "$log_dir" "$ACCOUNT")"
-    info "RETRIEVE_JOB_ID=$job_id"
-    info "LOG_DIR=$log_dir"
-    info "Retrieval can continue asynchronously. After complete .tar.zst files are present, run:"
+    if [[ "$RUN_NOW" -eq 1 ]]; then
+        worker_unpackems "$archive_ns" "$work_dir" "$(basename "${archive_ns%/}")"
+    else
+        job_id="$(submit_unpackems_job "$archive_ns" "$work_dir" "$log_dir" "$ACCOUNT")"
+        info "UNPACKEMS_JOB_ID=$job_id"
+        info "LOG_DIR=$log_dir"
+    fi
+    info "When retrieval is complete, run:"
     info "  archive2tape unpack $(shell_quote "$work_dir") TARGET_DIR"
 }
 
@@ -803,22 +728,21 @@ cmd_get() {
     POSITIONAL=("$archive_ns" "$work_dir")
     cmd_retrieve
     info "UNPACK_TARGET=$target_dir"
-    info "When retrieval is complete and .tar.zst files are present, run:"
+    info "When retrieval is complete, run:"
     info "  archive2tape unpack $(shell_quote "$work_dir") $(shell_quote "$target_dir")"
 }
 
 cmd_unpack() {
     [[ "${#POSITIONAL[@]}" -eq 2 ]] || die "Usage: archive2tape unpack WORK_DIR TARGET_DIR"
-    local work_dir="${POSITIONAL[0]}" target_dir="${POSITIONAL[1]}" archive_manifest
-    archive_manifest="$work_dir/archive2tape_archive_objects.txt"
+    local work_dir="${POSITIONAL[0]}" target_dir="${POSITIONAL[1]}"
     info "WORK_DIR=$work_dir"
     info "TARGET_DIR=$target_dir"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        info "Would unpack these local tar objects:"
-        select_local_tar_objects "$work_dir" "$archive_manifest" "$ALL_OBJECTS" || true
+        info "Would decompress from:"
+        select_compressed_root "$work_dir"
         return 0
     fi
-    worker_unpack "$work_dir" "$target_dir" "$archive_manifest" "$ALL_OBJECTS"
+    worker_decompress "$work_dir" "$target_dir" "$OVERWRITE"
 }
 
 case "$COMMAND" in
