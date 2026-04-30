@@ -1,6 +1,6 @@
 # Archive2Tape
 
-Levante helper for compressing selected model-output files, then using Packems to
+CLI fuction for compressing selected model-output files, then using Packems to
 pack, index, archive, retrieve, and unpack them through DKRZ HSM tape.
 
 `archive2tape` keeps a beginner-friendly interface around the maintained
