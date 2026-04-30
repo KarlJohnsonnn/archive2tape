@@ -179,6 +179,35 @@ not Packems-indexed. Restore those with the old workflow or manual
 `slk_helpers` retrieval. New Packems-backed archives should use `get`/`retrieve`
 plus `unpack`.
 
+Complete legacy restore example:
+
+```bash
+PROJECT=ab1234
+ACCOUNT="$PROJECT"
+ARCHIVE_DIR="/arch/$PROJECT/$USER/my_old_run"
+WORK_DIR="$GRAVEYARD/my_old_run_legacy_restore"
+TARGET_DIR="$PWD/my_old_run_restored"
+
+module load slk
+slk login
+
+mkdir -p "$WORK_DIR" "$TARGET_DIR"
+
+# Inspect the old archive namespace and choose the archived tar.zst object.
+slk list "$ARCHIVE_DIR"
+LEGACY_OBJECT="$ARCHIVE_DIR/my_old_run_0001.tar.zst"
+
+# Start recall/retrieval to local scratch. This submits Slurm retrieval work.
+slk_helpers recall "$LEGACY_OBJECT" -d "$WORK_DIR"
+slk_helpers retrieve "$LEGACY_OBJECT" -d "$WORK_DIR" -v --slurm "$ACCOUNT"
+
+# After the retrieval job has finished and the tarball exists locally, unpack it.
+zstd -dc "$WORK_DIR/$(basename "$LEGACY_OBJECT")" | tar -xf - -C "$TARGET_DIR"
+```
+
+If the old namespace contains several `.tar.zst` objects, repeat the
+`slk_helpers` and `zstd | tar` commands for each object.
+
 ## Local Checks
 
 Run local syntax, config, stubbed Packems, and compression round-trip checks:
