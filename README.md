@@ -1,11 +1,9 @@
 # Archive2Tape
 
-Self-contained Levante helper for packing selected model-output files to `tar.zst`,
+Levante helper for packing selected model-output files to `tar.zst`,
 archiving them to DKRZ HSM tape, retrieving them back to scratch, and unpacking them
 while preserving the source directory tree.
 
-This is the department-facing replacement for copying personal compression scripts.
-The older `scripts/nc_compression` directory remains as legacy/reference code.
 
 ## Setup
 
