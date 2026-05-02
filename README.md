@@ -45,14 +45,15 @@ tapeinit
 
 ## Test run
 
-Run local syntax, config, stubbed Packems, and compression round-trip checks:
+Run the local compression round-trip checks:
 
 ```bash
 bash share/archive2tape/test_archive2tape.sh
 ```
 
-The Packems tests use local stub binaries, so they do not require Levante or HSM
-access.
+The test script replaces Packems commands with local test commands. It checks
+the archive command flow without submitting jobs on Levante and without
+connecting to the HSM tape system.
 
 ## my_run: dry run with own data
 
