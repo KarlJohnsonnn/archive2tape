@@ -1,25 +1,40 @@
 # Archive2Tape
 
-CLI fuction for compressing selected model-output files, then using Packems to
-pack, index, archive, retrieve, and unpack them through DKRZ HSM tape.
+`archive2tape` prepares selected model-output files on DKRZ Levante and sends
+them to the DKRZ HSM tape system through Packems.
 
-`archive2tape` keeps a beginner-friendly interface around the maintained
-ESM tools:
+It exists to make archive and restore workflows less manual: files are selected,
+compressed, indexed, archived, retrieved, and unpacked with the same command
+structure. This should help teams archive ICON, COSMO, and similar numerical
+weather model output reproducibly.
 
-- local stage: select paths and compress them into `WORK_DIR/compressed`
-- tape stage: `packems` creates tar objects, archives them, and writes `INDEX.txt`
-- restore stage: `unpackems` retrieves the compressed staging tree, then
-  `archive2tape unpack` decompresses it into the target tree
+## Contents
 
-## Setup
+- [Install](#install)
+- [Test run](#test-run)
+- [my_run: dry run with own data](#my_run-dry-run-with-own-data)
+- [Configuration](#configuration)
+  - [Config file](#config-file)
+  - [Data layout](#data-layout)
+  - [Selected files](#selected-files)
+  - [Packems choices](#packems-choices)
+- [Reference](#reference)
+  - [Typical workflow (`put` / `get`)](#typical-workflow-put--get)
+  - [Step-by-step commands (`pack`, `archive`, `retrieve`, `unpack`)](#step-by-step-commands-pack-archive-retrieve-unpack)
+  - [Safety checks](#safety-checks)
+  - [Legacy archives](#legacy-archives)
+  - [Options](#options)
 
-Add this directory to your `PATH`:
+## Install
+
+Add this repository to your `PATH`:
 
 ```bash
 export PATH="/path/to/archive2tape/:$PATH"
 ```
 
-Before running `archive2tape` commands on Levante:
+On DKRZ Levante, initialize the Packems environment before running tape-facing
+commands:
 
 ```bash
 module load packems
@@ -28,7 +43,49 @@ tapeinit
 
 `tapeinit` checks or renews the StrongLink token used by Packems.
 
-Optional user defaults can live in a config file:
+## Test run
+
+Run local syntax, config, stubbed Packems, and compression round-trip checks:
+
+```bash
+bash share/archive2tape/test_archive2tape.sh
+```
+
+The Packems tests use local stub binaries, so they do not require Levante or HSM
+access.
+
+## my_run: dry run with own data
+
+Use `--dry-run` before submitting archive or retrieval work:
+
+```bash
+PROJECT=ab1234
+archive2tape put /path/to/model_output "/arch/$PROJECT/$USER/my_run" \
+  --project "$PROJECT" \
+  --work "$GRAVEYARD/my_run" \
+  --dry-run
+```
+
+If the plan looks right, remove `--dry-run` to archive selected files. Retrieve
+later from the same archive namespace:
+
+```bash
+archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive \
+  --project "$PROJECT" \
+  --work "$GRAVEYARD/my_run"
+```
+
+`get` runs `unpackems` to restore the compressed work tree from the Packems
+`INDEX.txt`. When retrieval is complete, run the printed `archive2tape unpack`
+command to decompress into `model_output_from_archive`.
+
+## Configuration
+
+### Config file
+
+Optional site or user defaults can live in a config file. Use `--config FILE`;
+CLI flags override config values. The parser accepts only known `KEY=VALUE`
+lines and rejects shell code.
 
 ```bash
 # archive2tape.conf
@@ -41,59 +98,7 @@ ALLOW_NON_SCRATCH_WORK=0
 INCLUDE_HIDDEN=0
 ```
 
-Use it with `--config archive2tape.conf`. CLI flags override config values. The
-config parser accepts only known `KEY=VALUE` lines and rejects shell code.
-
-## Beginner Workflow
-
-Archive selected files from `model_output_dir`:
-
-```bash
-PROJECT=ab1234
-archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
-  --project "$PROJECT" \
-  --work "$GRAVEYARD/my_run"
-```
-
-Start retrieval later:
-
-```bash
-PROJECT=ab1234
-archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive \
-  --project "$PROJECT" \
-  --work "$GRAVEYARD/my_run"
-```
-
-`get` runs `unpackems` to restore the compressed staging tree from the Packems
-`INDEX.txt`. When retrieval is complete, run the printed `archive2tape unpack`
-command to decompress into `model_output_from_archive`. Note that the path 
-`GRAVEYARD` is points to `/scratch/`, where data gets deleted 14 days after 
-the last file access. 
-
-
-## Stage Commands
-
-Use stage commands when debugging, restarting, or integrating with scripts:
-
-```bash
-PROJECT=ab1234
-archive2tape pack model_output_dir "$GRAVEYARD/my_run" --project "$PROJECT"
-archive2tape archive "$GRAVEYARD/my_run" "/arch/$PROJECT/$USER/my_run" --project "$PROJECT"
-
-archive2tape retrieve "/arch/$PROJECT/$USER/my_run" "$GRAVEYARD/my_run" --project "$PROJECT"
-archive2tape unpack "$GRAVEYARD/my_run" model_output_from_archive
-```
-
-Meanings:
-
-- `put`: `pack` plus Packems archive
-- `get`: `retrieve` plus printed `unpack` command
-- `pack`: select source paths and compress them into `WORK_DIR/compressed`
-- `archive`: use Packems on `WORK_DIR/compressed`
-- `retrieve`: use `unpackems` and Packems `INDEX.txt`
-- `unpack`: decompress restored staging files into a target directory
-
-## Data Layout
+### Data layout
 
 In `WORK_DIR/compressed`:
 
@@ -104,10 +109,10 @@ In `WORK_DIR/compressed`:
 - `archive2tape_metadata.env` records project, source, archive, and include info
 
 Packems then packs and archives the `compressed` directory. The archive namespace
-contains Packems tar objects and `INDEX.txt`, so `listems`/`unpackems` can inspect
-and restore the contents without local `.slurm` logs.
+contains Packems tar objects and `INDEX.txt`, so `listems` and `unpackems` can
+inspect and restore the contents without local `.slurm` logs.
 
-## Selected Files
+### Selected files
 
 Default include patterns:
 
@@ -123,7 +128,7 @@ Default include patterns:
 Add more patterns with repeated `--include` flags:
 
 ```bash
-archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
+archive2tape put /path/to/model_output "/arch/$PROJECT/$USER/my_run" \
   --project "$PROJECT" \
   --work "$GRAVEYARD/my_run" \
   --include '*.txt'
@@ -134,7 +139,7 @@ similar files are not archived accidentally. Use `--include-hidden` only when
 needed. If a selected directory such as `Meteogram_run.zarr` matches, descendants
 inside it are not selected separately.
 
-## Packems Choices
+### Packems choices
 
 `archive2tape archive` runs Packems in two phases:
 
@@ -152,7 +157,59 @@ behavior for the tape-facing work. Defaults follow DKRZ guidance:
 
 Override these through environment variables if needed.
 
-## Safety Checks
+## Reference
+
+### Typical workflow (`put` / `get`)
+
+Archive selected files from a model-output directory:
+
+```bash
+PROJECT=ab1234
+archive2tape put /path/to/model_output "/arch/$PROJECT/$USER/my_run" \
+  --project "$PROJECT" \
+  --work "$GRAVEYARD/my_run"
+```
+
+Start retrieval later from the same archive namespace:
+
+```bash
+PROJECT=ab1234
+archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive \
+  --project "$PROJECT" \
+  --work "$GRAVEYARD/my_run"
+```
+
+`get` runs `unpackems` to restore the compressed work-directory tree from the Packems
+`INDEX.txt`. When retrieval is complete, run the printed `archive2tape unpack`
+command to decompress into `model_output_from_archive`. On Levante, `$GRAVEYARD`
+points to scratch storage, where files are removed automatically after the
+site-defined retention period.
+
+### Step-by-step commands (`pack`, `archive`, `retrieve`, `unpack`)
+
+The shortcuts `put` and `get` chain these steps. Run the individual subcommands
+when you need to pause between phases, retry one phase, or call them from other
+scripts:
+
+```bash
+PROJECT=ab1234
+archive2tape pack /path/to/model_output "$GRAVEYARD/my_run" --project "$PROJECT"
+archive2tape archive "$GRAVEYARD/my_run" "/arch/$PROJECT/$USER/my_run" --project "$PROJECT"
+
+archive2tape retrieve "/arch/$PROJECT/$USER/my_run" "$GRAVEYARD/my_run" --project "$PROJECT"
+archive2tape unpack "$GRAVEYARD/my_run" model_output_from_archive
+```
+
+Meanings:
+
+- `put`: `pack` plus Packems archive
+- `get`: `retrieve` plus printed `unpack` command
+- `pack`: select source paths and compress them into `WORK_DIR/compressed`
+- `archive`: use Packems on `WORK_DIR/compressed`
+- `retrieve`: use `unpackems` and Packems `INDEX.txt`
+- `unpack`: decompress the retrieved compressed tree into a target directory
+
+### Safety checks
 
 The tool fails early when:
 
@@ -163,21 +220,14 @@ The tool fails early when:
 - no selected files are found
 - compressed outputs or decompressed targets already exist without `--overwrite`
 
-Use `--dry-run` before submitting jobs:
+Use `--dry-run` before submitting jobs (see **my_run** above).
 
-```bash
-archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" \
-  --project "$PROJECT" \
-  --work "$GRAVEYARD/my_run" \
-  --dry-run
-```
-
-## Legacy Archives
+### Legacy archives
 
 Archives created by earlier `archive2tape` versions as plain `.tar.zst` blobs are
 not Packems-indexed. Restore those with the old workflow or manual
-`slk_helpers` retrieval. New Packems-backed archives should use `get`/`retrieve`
-plus `unpack`.
+`slk_helpers` retrieval. New Packems-backed archives should use `get` or
+`retrieve` plus `unpack`.
 
 Complete legacy restore example:
 
@@ -208,18 +258,7 @@ zstd -dc "$WORK_DIR/$(basename "$LEGACY_OBJECT")" | tar -xf - -C "$TARGET_DIR"
 If the old namespace contains several `.tar.zst` objects, repeat the
 `slk_helpers` and `zstd | tar` commands for each object.
 
-## Local Checks
-
-Run local syntax, config, stubbed Packems, and compression round-trip checks:
-
-```bash
-bash share/archive2tape/test_archive2tape.sh
-```
-
-The Packems tests use local stub binaries, so they do not require Levante or HSM
-access.
-
-## Options
+### Options
 
 ```bash
 --config FILE                 Read defaults from archive2tape.conf-style KEY=VALUE file
@@ -236,5 +275,5 @@ access.
 --log-dir DIR                  Slurm log dir; default WORK_DIR/.slurm
 ```
 
-Use `--run-now` only in an interactive/compute allocation for real Packems
+Use `--run-now` only in an interactive or compute allocation for real Packems
 archive/retrieve commands.
