@@ -13,6 +13,23 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
 
+strip_sbatch_job_id() {
+    local j="${1:-}"
+    j="${j//[$'\t\r\n ']}"
+    j="${j%%;*}"
+    printf '%s\n' "$j"
+}
+
+require_sbatch_job_id() {
+    local stage="$1" raw="$2" num
+    raw="$(strip_sbatch_job_id "$raw")"
+    num="${raw%%.*}"
+    [[ "$num" =~ ^[1-9][0-9]*$ ]] ||
+        die "Slurm job submission failed for ${stage}: missing or invalid job id (parsed '${raw:-empty}'). Re-check Slurm (--account matches an account you belong to; often same as PROJECT) and partitions (PACK_PARTITION/ARCHIVE_PARTITION/RETRIEVE_PARTITION)."
+}
+
+default_slurm_log_dir() { printf '%s/.slurm\n' "${1%/}"; }
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -290,7 +307,7 @@ EOF
 
 submit_packems_job() {
     local work_dir="$1" archive_ns="$2" account="$3" dependency="${4:-}" job_id dep_args=()
-    local log_dir="${5:-$(printf '%s/.slurm' "$work_dir")}" dataset
+    local log_dir="${5:-$(default_slurm_log_dir "$work_dir")}" dataset
     mkdir -p "$log_dir"
     require_cmd sbatch
     dataset="$(basename "${archive_ns%/}")"
@@ -633,7 +650,7 @@ cmd_pack() {
     local source_dir="${POSITIONAL[0]}" work_dir="${POSITIONAL[1]}" log_dir job_id source_abs
     [[ -d "$source_dir" ]] || die "Missing source dir: $source_dir"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
-    log_dir="${LOG_DIR:-$work_dir/.slurm}"
+    log_dir="${LOG_DIR:-$(default_slurm_log_dir "$work_dir")}"
     prepare_compress_plan "$source_dir" "$work_dir" "" "$PROJECT" "$ACCOUNT" "$DRY_RUN"
     [[ "$DRY_RUN" -eq 1 ]] && return 0
     source_abs="$(dir_abs "$source_dir")"
@@ -641,6 +658,7 @@ cmd_pack() {
         worker_compress "$source_abs" "$work_dir" "$OVERWRITE"
     else
         job_id="$(submit_compress_job "$source_abs" "$work_dir" "$log_dir" "$ACCOUNT")"
+        require_sbatch_job_id "compress" "$job_id"
         info "COMPRESS_JOB_ID=$job_id"
         info "LOG_DIR=$log_dir"
     fi
@@ -653,7 +671,7 @@ cmd_archive() {
     archive_ns="$(resolve_archive_dir "$archive_ns")"
     validate_archive_ns "$archive_ns" "$PROJECT"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
-    log_dir="${LOG_DIR:-$work_dir/.slurm}"
+    log_dir="${LOG_DIR:-$(default_slurm_log_dir "$work_dir")}"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         dry_run_packems_archive "$work_dir" "$archive_ns"
         return 0
@@ -663,6 +681,7 @@ cmd_archive() {
         worker_packems_archive "$work_dir" "$archive_ns" "$(basename "${archive_ns%/}")"
     else
         job_id="$(submit_packems_job "$work_dir" "$archive_ns" "$ACCOUNT" "" "$log_dir")"
+        require_sbatch_job_id "packems" "$job_id"
         info "PACKEMS_JOB_ID=$job_id"
         info "LOG_DIR=$log_dir"
     fi
@@ -677,7 +696,7 @@ cmd_put() {
     validate_archive_ns "$archive_ns" "$PROJECT"
     work_dir="$(resolve_put_get_work_dir "$archive_ns" "$WORK")"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
-    log_dir="${LOG_DIR:-$work_dir/.slurm}"
+    log_dir="${LOG_DIR:-$(default_slurm_log_dir "$work_dir")}"
     prepare_compress_plan "$source_dir" "$work_dir" "$archive_ns" "$PROJECT" "$ACCOUNT" "$DRY_RUN"
     [[ "$DRY_RUN" -eq 1 ]] && return 0
     source_abs="$(dir_abs "$source_dir")"
@@ -686,7 +705,9 @@ cmd_put() {
         worker_packems_archive "$work_dir" "$archive_ns" "$(basename "${archive_ns%/}")"
     else
         compress_job="$(submit_compress_job "$source_abs" "$work_dir" "$log_dir" "$ACCOUNT")"
+        require_sbatch_job_id "compress" "$compress_job"
         packems_job="$(submit_packems_job "$work_dir" "$archive_ns" "$ACCOUNT" "$compress_job" "$log_dir")"
+        require_sbatch_job_id "packems" "$packems_job"
         info "COMPRESS_JOB_ID=$compress_job"
         info "PACKEMS_JOB_ID=$packems_job"
         info "PACKEMS_DEPENDENCY=afterok:$compress_job"
@@ -701,7 +722,7 @@ cmd_retrieve() {
     archive_ns="$(resolve_archive_dir "$archive_ns")"
     validate_archive_ns "$archive_ns" "$PROJECT"
     validate_work_dir "$work_dir" "$ALLOW_NON_SCRATCH_WORK" "$DRY_RUN"
-    log_dir="${LOG_DIR:-$work_dir/.slurm}"
+    log_dir="${LOG_DIR:-$(default_slurm_log_dir "$work_dir")}"
     if [[ "$DRY_RUN" -eq 1 ]]; then
         dry_run_unpackems "$archive_ns" "$work_dir"
         return 0
@@ -710,6 +731,7 @@ cmd_retrieve() {
         worker_unpackems "$archive_ns" "$work_dir" "$(basename "${archive_ns%/}")"
     else
         job_id="$(submit_unpackems_job "$archive_ns" "$work_dir" "$log_dir" "$ACCOUNT")"
+        require_sbatch_job_id "unpackems" "$job_id"
         info "UNPACKEMS_JOB_ID=$job_id"
         info "LOG_DIR=$log_dir"
     fi
