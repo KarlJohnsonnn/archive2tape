@@ -60,12 +60,14 @@ connecting to the HSM tape system.
 Use `--dry-run` before submitting archive or retrieval work:
 
 ```bash
-PROJECT=ab1234
+PROJECT=bb1234
 archive2tape put /path/to/model_output "/arch/$PROJECT/$USER/my_run" \
   --project "$PROJECT" \
   --work "$GRAVEYARD/my_run" \
   --dry-run
 ```
+
+Omitting `--account` uses `PROJECT` as the Slurm `--account` value (override when your site requires a different billing account).
 
 If the plan looks right, remove `--dry-run` to archive selected files. Retrieve
 later from the same archive namespace:

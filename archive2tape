@@ -25,7 +25,7 @@ require_sbatch_job_id() {
     raw="$(strip_sbatch_job_id "$raw")"
     num="${raw%%.*}"
     [[ "$num" =~ ^[1-9][0-9]*$ ]] ||
-        die "Slurm job submission failed for ${stage}: missing or invalid job id (parsed '${raw:-empty}'). Re-check Slurm (--account matches an account you belong to; often same as PROJECT) and partitions (PACK_PARTITION/ARCHIVE_PARTITION/RETRIEVE_PARTITION)."
+        die "Slurm job submission failed for ${stage}: missing or invalid job id (parsed '${raw:-empty}'). Re-check Slurm (sbatch --account via archive2tape --account; default PROJECT) and partitions (PACK_PARTITION/ARCHIVE_PARTITION/RETRIEVE_PARTITION)."
 }
 
 default_slurm_log_dir() { printf '%s/.slurm\n' "${1%/}"; }
@@ -33,19 +33,19 @@ default_slurm_log_dir() { printf '%s/.slurm\n' "${1%/}"; }
 usage() {
     cat <<'EOF'
 Usage:
-  archive2tape put SOURCE_DIR ARCHIVE_DIR --project PROJECT [--work WORK_DIR] [--config FILE]
-  archive2tape get ARCHIVE_DIR TARGET_DIR --project PROJECT [--work WORK_DIR] [--config FILE]
+  archive2tape put SOURCE_DIR ARCHIVE_DIR --project PROJECT [--account ACCOUNT] [--work WORK_DIR] [--config FILE]
+  archive2tape get ARCHIVE_DIR TARGET_DIR --project PROJECT [--account ACCOUNT] [--work WORK_DIR] [--config FILE]
 
 Stage commands:
-  archive2tape pack SOURCE_DIR WORK_DIR --project PROJECT
-  archive2tape archive WORK_DIR ARCHIVE_DIR --project PROJECT
-  archive2tape retrieve ARCHIVE_DIR WORK_DIR --project PROJECT
+  archive2tape pack SOURCE_DIR WORK_DIR --project PROJECT [--account ACCOUNT]
+  archive2tape archive WORK_DIR ARCHIVE_DIR --project PROJECT [--account ACCOUNT]
+  archive2tape retrieve ARCHIVE_DIR WORK_DIR --project PROJECT [--account ACCOUNT]
   archive2tape unpack WORK_DIR TARGET_DIR
 
 Common options:
   --config FILE                 Read defaults from archive2tape.conf-style KEY=VALUE file
   --project PROJECT              Must equal first segment after /arch/ in ARCHIVE_DIR
-  --account ACCOUNT              Slurm #SBATCH --account; defaults to PROJECT
+  --account ACCOUNT              Slurm #SBATCH --account; defaults to PROJECT if omitted
   --work WORK_DIR                Work dir for put/get; defaults to $GRAVEYARD/<dataset>
   --include GLOB                 Add selected pattern; defaults include nc, zarr, grib
   --include-hidden               Allow hidden paths when selecting files
@@ -58,8 +58,8 @@ Common options:
   --help                         Show this help
 
 Beginner workflow:
-    PROJECT=ab1234
-    archive2tape put model_output_dir "/arch/$PROJECT/$USER/my_run" --project "$PROJECT" --work "$GRAVEYARD/my_run"
+    PROJECT=bb1234
+    archive2tape put /path/to/model_output "/arch/$PROJECT/$USER/my_run" --project "$PROJECT" --work "$GRAVEYARD/my_run"
     archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive --project "$PROJECT" --work "$GRAVEYARD/my_run"
 EOF
 }
