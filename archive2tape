@@ -44,8 +44,8 @@ Stage commands:
 
 Common options:
   --config FILE                 Read defaults from archive2tape.conf-style KEY=VALUE file
-  --project PROJECT              Slurm/HSM project, must match /arch/<PROJECT>/...
-  --account ACCOUNT              Slurm account; defaults to PROJECT
+  --project PROJECT              Must equal first segment after /arch/ in ARCHIVE_DIR
+  --account ACCOUNT              Slurm #SBATCH --account; defaults to PROJECT
   --work WORK_DIR                Work dir for put/get; defaults to $GRAVEYARD/<dataset>
   --include GLOB                 Add selected pattern; defaults include nc, zarr, grib
   --include-hidden               Allow hidden paths when selecting files

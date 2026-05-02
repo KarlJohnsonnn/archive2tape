@@ -90,14 +90,16 @@ lines and rejects shell code.
 
 ```bash
 # archive2tape.conf
-PROJECT=ab1234
-ACCOUNT=ab1234
-WORK_ROOT=/scratch/b/ab1234/$USER/archive2tape
-ARCHIVE_ROOT=/arch/ab1234/$USER
+PROJECT=bb1234
+ACCOUNT=b123456
+WORK_ROOT=/scratch/b/$PROJECT/$USER/archive2tape
+ARCHIVE_ROOT=/arch/$PROJECT/$USER
 INCLUDE_PATTERNS=*.nc *.zarr *.grb *.grib *.grb2 *.grib2
 ALLOW_NON_SCRATCH_WORK=0
 INCLUDE_HIDDEN=0
 ```
+
+`PROJECT` must match the first path segment after `/arch/` for any archive namespace you pass or resolve through `ARCHIVE_ROOT`. `ACCOUNT` is the Slurm `--account` value for submitted jobs and defaults to `PROJECT` when omitted; on Levante it often differs from `PROJECT`.
 
 ### Data layout
 
@@ -165,18 +167,22 @@ Override these through environment variables if needed.
 Archive selected files from a model-output directory:
 
 ```bash
-PROJECT=ab1234
+PROJECT=bb1234
+ACCOUNT=b123456
 archive2tape put /path/to/model_output "/arch/$PROJECT/$USER/my_run" \
   --project "$PROJECT" \
+  --account "$ACCOUNT" \
   --work "$GRAVEYARD/my_run"
 ```
 
 Start retrieval later from the same archive namespace:
 
 ```bash
-PROJECT=ab1234
+PROJECT=bb1234
+ACCOUNT=b123456
 archive2tape get "/arch/$PROJECT/$USER/my_run" model_output_from_archive \
   --project "$PROJECT" \
+  --account "$ACCOUNT" \
   --work "$GRAVEYARD/my_run"
 ```
 
@@ -193,11 +199,12 @@ when you need to pause between phases, retry one phase, or call them from other
 scripts:
 
 ```bash
-PROJECT=ab1234
-archive2tape pack /path/to/model_output "$GRAVEYARD/my_run" --project "$PROJECT"
-archive2tape archive "$GRAVEYARD/my_run" "/arch/$PROJECT/$USER/my_run" --project "$PROJECT"
+PROJECT=bb1234
+ACCOUNT=b123456
+archive2tape pack /path/to/model_output "$GRAVEYARD/my_run" --project "$PROJECT" --account "$ACCOUNT"
+archive2tape archive "$GRAVEYARD/my_run" "/arch/$PROJECT/$USER/my_run" --project "$PROJECT" --account "$ACCOUNT"
 
-archive2tape retrieve "/arch/$PROJECT/$USER/my_run" "$GRAVEYARD/my_run" --project "$PROJECT"
+archive2tape retrieve "/arch/$PROJECT/$USER/my_run" "$GRAVEYARD/my_run" --project "$PROJECT" --account "$ACCOUNT"
 archive2tape unpack "$GRAVEYARD/my_run" model_output_from_archive
 ```
 
@@ -208,7 +215,7 @@ Meanings:
 - `pack`: select source paths and compress them into `WORK_DIR/compressed`
 - `archive`: use Packems on `WORK_DIR/compressed`
 - `retrieve`: use `unpackems` and Packems `INDEX.txt`
-- `unpack`: decompress the retrieved compressed tree into a target directory
+- `unpack`: decompress the retrieved compressed tree into a target directory (runs locally; Slurm `--account` does not apply)
 
 ### Safety checks
 
@@ -216,7 +223,7 @@ The tool fails early when:
 
 - `--project` is missing for Slurm/HSM commands
 - `ARCHIVE_DIR` does not look like `/arch/<project>/...`
-- `--project` does not match the project in the `/arch/...` path
+- `--project` does not match the first segment `<project>` of `ARCHIVE_DIR` after `/arch/`
 - the work directory is outside `/scratch` without `--allow-non-scratch-work`
 - no selected files are found
 - compressed outputs or decompressed targets already exist without `--overwrite`
@@ -233,8 +240,8 @@ not Packems-indexed. Restore those with the old workflow or manual
 Complete legacy restore example:
 
 ```bash
-PROJECT=ab1234
-ACCOUNT="$PROJECT"
+PROJECT=bb1234
+ACCOUNT=b123456
 ARCHIVE_DIR="/arch/$PROJECT/$USER/my_old_run"
 WORK_DIR="$GRAVEYARD/my_old_run_legacy_restore"
 TARGET_DIR="$PWD/my_old_run_restored"
@@ -263,8 +270,8 @@ If the old namespace contains several `.tar.zst` objects, repeat the
 
 ```bash
 --config FILE                 Read defaults from archive2tape.conf-style KEY=VALUE file
---project PROJECT              Slurm/HSM project, must match /arch/<PROJECT>/...
---account ACCOUNT              Slurm account; defaults to PROJECT
+--project PROJECT              Must equal first segment after /arch/ in ARCHIVE_DIR
+--account ACCOUNT              Slurm #SBATCH --account; defaults to PROJECT if omitted
 --work WORK_DIR                Work dir for put/get; defaults to $GRAVEYARD/<dataset>
 --include GLOB                 Add selected pattern
 --include-hidden               Allow hidden paths during selection

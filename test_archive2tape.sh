@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 archive2tape = Path(sys.argv[1])
-repo = archive2tape.parents[2]
+repo = archive2tape.parent
 
 
 def run(args, check=True, env=None):
@@ -111,7 +111,7 @@ import tempfile
 from pathlib import Path
 
 archive2tape = Path(sys.argv[1])
-repo = archive2tape.parents[2]
+repo = archive2tape.parent
 
 
 def run(args, check=True, env=None):
