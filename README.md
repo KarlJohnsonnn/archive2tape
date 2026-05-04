@@ -16,7 +16,7 @@ The tradeoff is that tape is not interactive storage. Archiving and retrieval ca
 take time, HSM access depends on valid DKRZ/StrongLink credentials, and users
 must keep `PROJECT`, `ACCOUNT`, archive paths, and scratch work directories
 consistent. Use `--dry-run` before submitting jobs to check the plan before data
-moves.eather model output reproducibly.
+moves.
 
 ## Contents
 
