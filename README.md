@@ -1,12 +1,22 @@
 # Archive2Tape
 
-`archive2tape` prepares selected model-output files on DKRZ Levante and sends
-them to the DKRZ HSM (hierarchical storage management) tape system through Packems.
+`archive2tape` helps Levante users archive and retrieve large simulation output
+through the DKRZ HSM tape archive with a repeatable command-line workflow. It is
+especially useful when scratch and work storage are limited and model output must
+be moved to tape soon after a simulation finishes.
 
-It exists to make archive and restore workflows less manual: files are selected,
-compressed, indexed, archived, retrieved, and unpacked with the same command
-structure. This should help teams archive ICON, COSMO, and similar numerical
-weather model output reproducibly.
+The main benefit is that archive and restore steps become explicit and
+reproducible: files are selected by pattern, compressed, staged, archived with
+Packems, indexed, retrieved, and unpacked in a documented order. This reduces
+manual tape handling, makes later recovery easier, and helps teams preserve ICON,
+COSMO, and similar numerical weather model output beyond short filesystem
+retention times.
+
+The tradeoff is that tape is not interactive storage. Archiving and retrieval can
+take time, HSM access depends on valid DKRZ/StrongLink credentials, and users
+must keep `PROJECT`, `ACCOUNT`, archive paths, and scratch work directories
+consistent. Use `--dry-run` before submitting jobs to check the plan before data
+moves.eather model output reproducibly.
 
 ## Contents
 
