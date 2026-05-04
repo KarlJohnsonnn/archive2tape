@@ -1,7 +1,7 @@
 # Archive2Tape
 
 `archive2tape` prepares selected model-output files on DKRZ Levante and sends
-them to the DKRZ HSM tape system through Packems.
+them to the DKRZ HSM (hierarchical storage management) tape system through Packems.
 
 It exists to make archive and restore workflows less manual: files are selected,
 compressed, indexed, archived, retrieved, and unpacked with the same command
@@ -27,11 +27,14 @@ weather model output reproducibly.
 
 ## Install
 
-Add this repository to your `PATH`:
+Clone the repo and add this repository to your `PATH`:
 
 ```bash
-export PATH="/path/to/archive2tape/:$PATH"
+git clone https://github.com/KarlJohnsonnn/archive2tape.git
+cd archive2tape
+export PATH="$(pwd)/:$PATH"
 ```
+
 
 On DKRZ Levante, initialize the Packems environment before running tape-facing
 commands:
@@ -41,7 +44,7 @@ module load packems
 tapeinit
 ```
 
-`tapeinit` checks or renews the StrongLink token used by Packems.
+`tapeinit` checks or renews the StrongLink token used by Packems. StrongLink is a software library used to operates the HSM tape archive. Use the [DKRZ documentation](https://docs.dkrz.de/doc/datastorage/hsm/index.html) for further information.
 
 ## Test run
 
