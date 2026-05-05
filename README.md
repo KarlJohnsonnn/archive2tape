@@ -1,4 +1,4 @@
-# Archive2Tape
+# archive2tape
 
 `archive2tape` helps Levante users archive and retrieve large simulation output
 through the DKRZ HSM tape archive with a repeatable command-line workflow. It is
